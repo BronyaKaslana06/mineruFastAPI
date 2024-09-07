@@ -2,3 +2,5 @@ mineru/
 uploads/
 __pycache__/
 *.pdf
+logs/
+*.log

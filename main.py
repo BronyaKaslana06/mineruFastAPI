@@ -1,18 +1,19 @@
 import os
-import aiofiles
-from typing import Union
-
-from fastapi import FastAPI, File, UploadFile
-from pydantic import BaseModel
-
 import json
 import copy
+import aiofiles
+import concurrent.futures
+from typing import List
 
 from loguru import logger
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 
 from magic_pdf.pipe.UNIPipe import UNIPipe
 from magic_pdf.pipe.OCRPipe import OCRPipe
 from magic_pdf.pipe.TXTPipe import TXTPipe
+from magic_pdf.pipe.AbsPipe import AbsPipe
+from initModelPipe.ModelPipe import ModelPipe
 from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
 import magic_pdf.model as model_config
 
@@ -20,54 +21,38 @@ model_config.__use_inside_model__ = True
 
 app = FastAPI()
 
-# 创建一个用于存储上传文件的目录
+ocr_model = None
+txt_model = None
+
+def init_model():
+    from magic_pdf.model.doc_analyze_by_custom_model import ModelSingleton
+    try:
+        model_manager = ModelSingleton()
+        global ocr_model, txt_model
+        txt_model = model_manager.get_model(False, False)
+        logger.info(f"txt_model init final")
+        ocr_model = model_manager.get_model(True, False)
+        logger.info(f"ocr_model init final")
+        return 0
+    except Exception as e:
+        logger.exception(e)
+        return -1
+
+@app.on_event("startup")
+async def startup_event():
+    model_init = init_model()
+    logger.info(f"model_init: {model_init}")
+
+# 上传目录
 UPLOAD_DIRECTORY = "uploads"
 PDF_EXTRACT_DIRECTORY = "mineru"
 
 # 确保上传目录存在
 if not os.path.exists(UPLOAD_DIRECTORY):
     os.makedirs(UPLOAD_DIRECTORY)
-
 if not os.path.exists(PDF_EXTRACT_DIRECTORY):
     os.makedirs(PDF_EXTRACT_DIRECTORY)
 
-class Item(BaseModel):
-    name: str
-    price: float
-    is_offer: Union[bool, None] = None
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
-
-@app.post("/uploadfile/")
-async def create_upload_file(file: UploadFile):
-    # 定义文件的存储路径
-    file_location = os.path.join(UPLOAD_DIRECTORY, file.filename)
-
-    # 使用异步上下文管理器保存文件
-    async with aiofiles.open(file_location, 'wb') as out_file:
-        contents = await file.read()  # 读取文件内容
-        await out_file.write(contents)  # 将内容写入目标文件
-    return {"filename" : file.filename, "content_type": file.content_type}
-
-@app.post("/mineru/")
-async def create_upload_file(file: UploadFile):
-    try:
-    # 定义文件的存储路径
-        file_location = os.path.join(UPLOAD_DIRECTORY, file.filename)
-
-        # 使用异步上下文管理器保存文件
-        async with aiofiles.open(file_location, 'wb') as out_file:
-            contents = await file.read()  # 读取文件内容
-            await out_file.write(contents)  # 将内容写入目标文件
-
-        #pdf解析
-        await pdf_parse_main(pdf_path=file_location, output_dir=PDF_EXTRACT_DIRECTORY)
-        return {"filename" : file.filename, "pdf_path": PDF_EXTRACT_DIRECTORY + "/" + file.filename.split('.')[0]}
-    except Exception as e:
-        return {"error": str(e)}
 
 def json_md_dump(
         pipe,
@@ -76,47 +61,37 @@ def json_md_dump(
         content_list,
         md_content,
 ):
-    # 写入模型结果到 model.json
     orig_model_list = copy.deepcopy(pipe.model_list)
     md_writer.write(
         content=json.dumps(orig_model_list, ensure_ascii=False, indent=4),
         path=f"{pdf_name}_model.json"
     )
 
-    # 写入中间结果到 middle.json
     md_writer.write(
         content=json.dumps(pipe.pdf_mid_data, ensure_ascii=False, indent=4),
         path=f"{pdf_name}_middle.json"
     )
 
-    # text文本结果写入到 conent_list.json
     md_writer.write(
         content=json.dumps(content_list, ensure_ascii=False, indent=4),
         path=f"{pdf_name}_content_list.json"
     )
 
-    # 写入结果到 .md 文件中
     md_writer.write(
         content=md_content,
         path=f"{pdf_name}.md"
     )
 
-async def pdf_parse_main(
+model_init = init_model()
+logger.info(f"model_init: {model_init}")
+
+def pdf_parse_main(
         pdf_path: str,
         parse_method: str = 'auto',
         model_json_path: str = None,
         is_json_md_dump: bool = True,
         output_dir: str = None
 ):
-    """
-    执行从 pdf 转换到 json、md 的过程，输出 md 和 json 文件到 pdf 文件所在的目录
-
-    :param pdf_path: .pdf 文件的路径，可以是相对路径，也可以是绝对路径
-    :param parse_method: 解析方法， 共 auto、ocr、txt 三种，默认 auto，如果效果不好，可以尝试 ocr
-    :param model_json_path: 已经存在的模型数据文件，如果为空则使用内置模型，pdf 和 model_json 务必对应
-    :param is_json_md_dump: 是否将解析后的数据写入到 .json 和 .md 文件中，默认 True，会将不同阶段的数据写入到不同的 .json 文件中（共3个.json文件），md内容会保存到 .md 文件中
-    :param output_dir: 输出结果的目录地址，会生成一个以 pdf 文件名命名的文件夹并保存所有结果
-    """
     try:
         pdf_name = os.path.basename(pdf_path).split(".")[0]
         pdf_path_parent = os.path.dirname(pdf_path)
@@ -128,57 +103,107 @@ async def pdf_parse_main(
 
         output_image_path = os.path.join(output_path, 'images')
 
-        # 获取图片的父路径，为的是以相对路径保存到 .md 和 conent_list.json 文件中
         image_path_parent = os.path.basename(output_image_path)
 
         pdf_bytes = open(pdf_path, "rb").read()  # 读取 pdf 文件的二进制数据
 
         if model_json_path:
-            # 读取已经被模型解析后的pdf文件的 json 原始数据，list 类型
             model_json = json.loads(open(model_json_path, "r", encoding="utf-8").read())
         else:
             model_json = []
 
-        # 执行解析步骤
-        # image_writer = DiskReaderWriter(output_image_path)
         image_writer, md_writer = DiskReaderWriter(output_image_path), DiskReaderWriter(output_path)
 
-        # 选择解析方式
-        # jso_useful_key = {"_pdf_type": "", "model_list": model_json}
-        # pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
-        if parse_method == "auto":
-            jso_useful_key = {"_pdf_type": "", "model_list": model_json}
-            pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
-        elif parse_method == "txt":
-            pipe = TXTPipe(pdf_bytes, model_json, image_writer)
-        elif parse_method == "ocr":
-            pipe = OCRPipe(pdf_bytes, model_json, image_writer)
-        else:
-            logger.error("unknown parse method, only auto, ocr, txt allowed")
-            exit(1)
+        # if parse_method == "auto":
+        #     jso_useful_key = {"_pdf_type": "", "model_list": model_json}
+            # pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
+        # elif parse_method == "txt":
+        #     pipe = TXTPipe(pdf_bytes, model_json, image_writer)
+        # elif parse_method == "ocr":
+        #     pipe = OCRPipe(pdf_bytes, model_json, image_writer)
+        # else:
+        #     logger.error("unknown parse method, only auto, ocr, txt allowed")
+        #     return {"error": "unknown parse method"}
+        
+        global ocr_model, txt_model
+        jso_useful_key = {"_pdf_type": "", "model_list": model_json}
+        pipe = ModelPipe(pdf_bytes=pdf_bytes, jso_useful_key=jso_useful_key, image_writer=image_writer, ocr_model=ocr_model, txt_model=txt_model)
 
-        # 执行分类
         pipe.pipe_classify()
 
-        # 如果没有传入模型数据，则使用内置模型解析
         if not model_json:
             if model_config.__use_inside_model__:
                 pipe.pipe_analyze()  # 解析
             else:
                 logger.error("need model list input")
-                exit(1)
+                return {"error": "need model list input"}
 
-        # 执行解析
         pipe.pipe_parse()
 
-        # 保存 text 和 md 格式的结果
         content_list = pipe.pipe_mk_uni_format(image_path_parent, drop_mode="none")
         md_content = pipe.pipe_mk_markdown(image_path_parent, drop_mode="none")
-
 
         if is_json_md_dump:
             json_md_dump(pipe, md_writer, pdf_name, content_list, md_content)
 
+        return {"status": "success", "pdf_name": pdf_name}
 
     except Exception as e:
         logger.exception(e)
+        return {"error": str(e)}
+
+@app.post("/uploadfile/")
+async def create_upload_file(file: UploadFile):
+    try:
+    # 定义文件的存储路径
+        file_location = os.path.join(UPLOAD_DIRECTORY, file.filename)
+
+        # 使用异步上下文管理器保存文件
+        async with aiofiles.open(file_location, 'wb') as out_file:
+            contents = await file.read()  # 读取文件内容
+            await out_file.write(contents)  # 将内容写入目标文件
+
+        #pdf解析
+        pdf_parse_main(pdf_path=file_location, output_dir=PDF_EXTRACT_DIRECTORY)
+        return {"filename" : file.filename, "pdf_path": PDF_EXTRACT_DIRECTORY + "/" + file.filename.split('.')[0]}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/uploadfiles/")
+async def upload_files(files: List[UploadFile] = File(...)):
+    results = []
+
+    def process_file(file: UploadFile):
+        try:
+            # 定义文件的存储路径
+            file_location = os.path.join(UPLOAD_DIRECTORY, file.filename)
+
+            # 使用异步上下文管理器保存文件
+            with open(file_location, 'wb') as out_file:
+                contents = file.file.read()  # 读取文件内容
+                out_file.write(contents)  # 将内容写入目标文件
+
+            # 调用 PDF 解析主函数
+            result = pdf_parse_main(file_location, output_dir=PDF_EXTRACT_DIRECTORY)
+            return {file.filename: result}
+        except Exception as e:
+            return {file.filename: {"error": str(e)}}
+
+    # 使用线程池来并行处理文件
+    max_workers = 2  # 最大线程数量
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_file, file) for file in files]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    return JSONResponse(content={"results": results})
+
+@app.get("/test")
+def read_root():
+    return {"Hello": "World"}
+
+
+if __name__ == '__main__':
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
